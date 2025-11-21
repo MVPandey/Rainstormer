@@ -1,10 +1,13 @@
 """Contains the chat model service class."""
 
+import inspect
+import json
+
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 from pydantic import BaseModel, Field, SecretStr
 
-from ..schema.llm.message import ChatMessage
+from ..schema.llm.message import ChatMessage, ChatRole, Tool, ToolCall, ToolCallFunction
 from ..utils.config import Config
 from ..utils.exceptions import ChatModelError
 from ..utils.logger import logger
@@ -27,13 +30,17 @@ class ChatModelHyperparams(BaseModel):
 class ChatModelService:
     """Service class for the chat model."""
 
+    # ============================================================================
+    # Initialization
+    # ============================================================================
+
     def __init__(
         self,
         api_key: str | SecretStr | None = None,
         base_url: str | None = None,
         model_name: str | None = None,
-        hyperparams: ChatModelHyperparams | None = None,
         config: Config | None = None,
+        max_tool_iterations: int = 50,
     ):
         """
         Initialize the chat model service.
@@ -42,10 +49,9 @@ class ChatModelService:
             api_key: API key for the LLM service.
             base_url: Base URL for the LLM service.
             model_name: Name of the model to use.
-            hyperparams: Hyperparameters for the model.
             config: Optional Config object to fall back to.
+            max_tool_iterations: Safety cap for recursive tool executions.
         """
-        self.hyperparams = hyperparams
         self.llm_api_key = api_key or (config.llm_api_key if config else None)
         self.llm_base_url = (
             base_url
@@ -55,6 +61,7 @@ class ChatModelService:
         self.llm_name = (
             model_name or (config.llm_name if config else None) or "openai/gpt-4o"
         )
+        self.max_tool_iterations = max(1, max_tool_iterations)
 
         if not self.llm_api_key:
             logger.warning("No API key provided for ChatModelService.")
@@ -73,25 +80,262 @@ class ChatModelService:
             f"Initialized ChatModelService with model={self.llm_name}, base_url={self.llm_base_url}"
         )
 
+    async def __aenter__(self):
+        """Enter async context manager."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit async context manager - cleanup resources."""
+        await self._client.close()
+        return False
+
+    # ============================================================================
+    # Public Interface
+    # ============================================================================
+
     async def _chat(
         self,
-        messages: list[ChatMessage] | ChatMessage,
+        messages: list[ChatMessage] | ChatMessage | str,
+        hyperparams: ChatModelHyperparams | None = None,
+        tools: list[Tool] | None = None,
     ) -> ChatCompletion:
-        """Chat with the model."""
-        logger.debug(f"Initiating chat completion with {len(messages)} messages")
-
+        """
+        Execute a chat completion, optionally handling tool calls until resolution.
+        """
         try:
-            if not isinstance(messages, list):
-                messages = [messages]
-            completion = await self._client.chat.completions.create(
-                model=self.llm_name,
-                messages=messages,
-                **(self.hyperparams.model_dump() if self.hyperparams else {}),
+            normalized_messages = self._normalize_messages(messages)
+            tool_defs, tool_map = self._prepare_tools(tools)
+
+            completion = await self._create_completion(
+                normalized_messages, hyperparams, tool_defs
             )
+
+            iteration = 0
+            while (
+                tool_map
+                and completion.choices
+                and completion.choices[0].message.tool_calls
+            ):
+                if iteration >= self.max_tool_iterations:
+                    raise ChatModelError(
+                        "Maximum tool iterations exceeded. Possible tool loop detected."
+                    )
+
+                assistant_message = self._from_completion_message(
+                    completion.choices[0].message
+                )
+                normalized_messages.append(assistant_message)
+                tool_responses = await self._run_tool_calls(
+                    assistant_message.tool_calls, tool_map
+                )
+                normalized_messages.extend(tool_responses)
+
+                completion = await self._create_completion(
+                    normalized_messages, hyperparams, tool_defs
+                )
+                iteration += 1
 
             logger.debug("Chat completion received")
             return completion
 
-        except Exception as e:
-            logger.error(f"Chat completion failed: {e}")
-            raise ChatModelError(f"Error chatting with model: {e}") from e
+        except ChatModelError:
+            raise
+        except Exception as exc:
+            logger.error(f"Chat completion failed: {exc}")
+            raise ChatModelError(f"Error chatting with model: {exc}") from exc
+
+    # ============================================================================
+    # Message Processing
+    # ============================================================================
+
+    async def _create_completion(
+        self,
+        messages: list[ChatMessage],
+        hyperparams: ChatModelHyperparams | None,
+        tool_defs: list[dict[str, object]] | None,
+    ) -> ChatCompletion:
+        """Invoke the OpenAI completion endpoint."""
+        # normalize messages for OpenAI API (e.g., DEVELOPER -> SYSTEM)
+        normalized_for_api: list[ChatMessage] = []
+        for m in messages:
+            if m.role == ChatRole.DEVELOPER:
+                # OpenAI doesn't support DEVELOPER role, map to SYSTEM
+                m = ChatMessage(**{**m.model_dump(), "role": ChatRole.SYSTEM})
+            normalized_for_api.append(m)
+
+        payload_messages = [
+            message.model_dump(
+                exclude_none=True,
+                mode="json",
+                exclude={"created_at"},
+            )
+            for message in normalized_for_api
+        ]
+
+        request_kwargs: dict[str, object] = {
+            "model": self.llm_name,
+            "messages": payload_messages,
+        }
+
+        if hyperparams:
+            request_kwargs.update(hyperparams.model_dump(exclude_none=True))
+        if tool_defs:
+            request_kwargs["tools"] = tool_defs
+
+        logger.debug(
+            "Dispatching chat completion request",
+            extra={"has_tools": bool(tool_defs), "message_count": len(messages)},
+        )
+
+        return await self._client.chat.completions.create(**request_kwargs)
+
+    @staticmethod
+    def _normalize_messages(
+        messages: list[ChatMessage] | ChatMessage | str,
+    ) -> list[ChatMessage]:
+        """Ensure all inputs are ChatMessage instances."""
+        if isinstance(messages, str):
+            return [ChatMessage(role=ChatRole.USER, content=messages)]
+
+        if isinstance(messages, ChatMessage):
+            return [messages]
+
+        normalized: list[ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ChatMessage):
+                normalized.append(message)
+            elif isinstance(message, str):
+                normalized.append(ChatMessage(role=ChatRole.USER, content=message))
+            elif isinstance(message, dict):
+                normalized.append(ChatMessage(**message))
+            else:
+                raise ChatModelError(
+                    f"Unsupported message type: {type(message).__name__}"
+                )
+        return normalized
+
+    @staticmethod
+    def _from_completion_message(openai_message) -> ChatMessage:
+        """Convert an OpenAI completion message into a ChatMessage."""
+        content = openai_message.content
+        if isinstance(content, list):
+            # some providers return structured content arrays
+            content = "".join(
+                fragment.get("text", "")
+                if isinstance(fragment, dict)
+                else str(fragment)
+                for fragment in content
+            )
+
+        tool_calls = None
+        if openai_message.tool_calls:
+            tool_calls = [
+                ToolCall(
+                    id=tool_call.id,
+                    type=tool_call.type or "function",
+                    function=ToolCallFunction(
+                        name=tool_call.function.name,
+                        arguments=tool_call.function.arguments or "{}",
+                    ),
+                )
+                for tool_call in openai_message.tool_calls
+            ]
+
+        return ChatMessage(
+            role=ChatRole(openai_message.role),
+            content=content,
+            tool_calls=tool_calls,
+        )
+
+    # ============================================================================
+    # Tool Handling
+    # ============================================================================
+
+    def _prepare_tools(
+        self, tools: list[Tool] | None
+    ) -> tuple[list[dict[str, object]] | None, dict[str, Tool]]:
+        """Prepare tool definitions and lookup map for execution."""
+        if not tools:
+            return None, {}
+
+        tool_map: dict[str, Tool] = {}
+        tool_defs: list[dict[str, object]] = []
+        for tool in tools:
+            if tool.name in tool_map:
+                raise ChatModelError(f"Duplicate tool name detected: {tool.name}")
+            tool_map[tool.name] = tool
+            tool_defs.append(tool.to_openai_param())
+
+        return tool_defs, tool_map
+
+    async def _run_tool_calls(
+        self, tool_calls: list[ToolCall] | None, tool_map: dict[str, Tool]
+    ) -> list[ChatMessage]:
+        """Execute the requested tool calls and return tool response messages."""
+        if not tool_calls:
+            return []
+
+        responses: list[ChatMessage] = []
+        for tool_call in tool_calls:
+            tool_name = tool_call.function.name
+            tool = tool_map.get(tool_name)
+            if not tool:
+                raise ChatModelError(f"Received unknown tool call: {tool_name}")
+
+            arguments = self._parse_tool_arguments(tool_call.function.arguments)
+            result = await self._invoke_tool(tool, arguments)
+
+            responses.append(
+                ChatMessage(
+                    role=ChatRole.TOOL,
+                    name=tool_name,
+                    content=result,
+                    tool_call_id=tool_call.id,
+                )
+            )
+
+        return responses
+
+    async def _invoke_tool(self, tool: Tool, arguments: dict[str, object]) -> str:
+        """Invoke tool handler and normalize the result."""
+        sig = inspect.signature(tool.handler)
+        params = list(sig.parameters.values())
+
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+
+        if accepts_kwargs or len(params) != 1:
+            try:
+                result = tool.handler(**arguments)
+            except TypeError:
+                result = tool.handler(arguments)
+        else:
+            result = tool.handler(arguments)
+
+        if inspect.isawaitable(result):
+            result = await result
+
+        if isinstance(result, (dict, list)):
+            return json.dumps(result)
+
+        if not isinstance(result, str):
+            return str(result)
+
+        return result
+
+    @staticmethod
+    def _parse_tool_arguments(arguments: str | None) -> dict[str, object]:
+        """Parse the JSON arguments string provided by the model."""
+        if not arguments:
+            return {}
+
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise ChatModelError(
+                f"Invalid JSON in tool arguments: {arguments}"
+            ) from exc
+
+        if not isinstance(parsed, dict):
+            raise ChatModelError("Tool arguments must decode into a JSON object.")
+
+        return parsed
