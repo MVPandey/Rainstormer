@@ -31,19 +31,16 @@ class ChatModelHyperparams(BaseModel):
 class ModelConfig(BaseModel):
     """Configuration for multi-model strategy."""
 
-    # Primary model for main generation (assistant responses)
     primary_model: str = Field(
-        default="anthropic/claude-sonnet-4",
+        default="google/gemini-3-pro-preview",
         description="Primary model for high-quality generation",
     )
 
-    # Cheaper model for auxiliary tasks
     auxiliary_model: str = Field(
-        default="openai/gpt-4o-mini",
+        default="openai/o3-mini",
         description="Cheaper model for judges, simulated users, etc.",
     )
 
-    # Model assignments by task type
     @property
     def model_for_generation(self) -> str:
         """Model for main brainstorming generation."""
@@ -102,7 +99,7 @@ class ChatModelService:
             or "https://openrouter.ai/api/v1"
         )
         self.llm_name = (
-            model_name or (config.llm_name if config else None) or "openai/gpt-4o"
+            model_name or (config.llm_name if config else None) or "openai/o3-mini"
         )
         self.max_tool_iterations = max(1, max_tool_iterations)
 

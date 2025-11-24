@@ -4,12 +4,31 @@ import asyncio
 from collections import Counter
 
 from ..schema.llm.message import ChatMessage, ChatRole
-from ..schema.mcts import MCTSNode, MCTSTree
-from ..services.chat import ChatModelService, ChatModelHyperparams
+from ..schema.mcts import MCTSNode, MCTSTree, TurnSummary
+from ..schema.scoring import TurnScore, FinalScore, SimulationResult, EarlyTermination
+from ..schema.structured_output import (
+    PCBResponse,
+    TurnRole,
+    TURN_CONFIGS,
+    MicroJudgeVerdict,
+)
+from ..services.chat import ChatModelService, ChatModelHyperparams, ModelConfig
 from ..prompts.mcts import (
     GENERATION_SYSTEM_PROMPT,
     SIMULATION_USER_SYSTEM_PROMPT,
     JUDGE_SYSTEM_PROMPT,
+    MICRO_JUDGE_SYSTEM_PROMPT,
+    MICRO_JUDGE_USER_TEMPLATE,
+    FINAL_JUDGE_SYSTEM_PROMPT,
+    FINAL_JUDGE_USER_TEMPLATE,
+    NOVELTY_JUDGE_SYSTEM_PROMPT,
+    NOVELTY_JUDGE_USER_TEMPLATE,
+)
+from ..prompts.structured import (
+    get_role_prompt,
+    get_simulated_user_prompt,
+    build_simulation_context,
+    PCB_SCHEMA_INSTRUCTION,
 )
 from ..utils.logger import logger
 
@@ -17,9 +36,16 @@ from ..utils.logger import logger
 class MCTSService:
     """Service for Monte Carlo Tree Search brainstorming."""
 
-    def __init__(self, llm_service: ChatModelService):
+    def __init__(
+        self,
+        llm_service: ChatModelService,
+        model_config: ModelConfig | None = None,
+    ):
         self.llm_service = llm_service
+        self.model_config = model_config or ModelConfig()
         self.tree: MCTSTree | None = None
+        self.context_messages: list[ChatMessage] = []
+        self._original_idea: str = ""
 
     async def run(
         self,
@@ -45,6 +71,7 @@ class MCTSService:
         # If there are prior messages, we might want to store them to provide context
         # For simplicity, we'll pass the full context to the LLM but the tree starts at the last message
         self.context_messages = initial_messages[:-1]
+        self._original_idea = root_message.content or ""
 
         for i in range(iterations):
             logger.info(f"MCTS Iteration {i + 1}/{iterations}")
@@ -253,56 +280,317 @@ class MCTSService:
 
     async def _simulate(self, node: MCTSNode) -> float:
         """
-        Simulate a conversation rollout.
-        Returns a score (0.0 to 1.0) based on the quality/length of the conversation.
-        For this MVP, we'll simulate 2 turns and rate the final outcome.
+        Simulate a 6-turn conversation rollout with role choreography.
+
+        Returns a score (0.0 to 1.0) based on multi-dimensional evaluation:
+        - Per-turn micro-scores (structure, novelty, depth, engagement, progress)
+        - Final judge evaluation (convergence, coverage, coherence, outcome)
+        - Trajectory bonus for improvement over turns
         """
-        logger.info(f"Simulating from node {node.id}")
+        logger.info(f"Simulating 6-turn exchange from node {node.id}")
 
         history = self._get_history(node)
         current_history = list(history)
+        simulation_messages: list[ChatMessage] = []
 
-        # Simulate User -> Assistant -> User -> Assistant
-        turns = 2
-        for _ in range(turns):
-            # User turn (Simulated)
-            sim_user_messages = [
-                ChatMessage(role=ChatRole.SYSTEM, content=SIMULATION_USER_SYSTEM_PROMPT)
-            ] + current_history
+        # Track scoring
+        turn_scores: list[TurnScore] = []
+        early_termination = EarlyTermination.NONE
+
+        # Build compressed context for prompts
+        compressed_context = self._build_compressed_context(node)
+
+        # Run 6-turn simulation with role choreography
+        for turn_config in TURN_CONFIGS:
+            turn_num = turn_config.turn_number
+            role = turn_config.role
+            temperature = turn_config.temperature
+
+            logger.debug(f"Simulation turn {turn_num}: {role.value}")
 
             try:
+                # === Simulated User Turn ===
+                user_prompt = get_simulated_user_prompt(turn_num)
+                sim_user_messages = [
+                    ChatMessage(role=ChatRole.SYSTEM, content=user_prompt)
+                ] + current_history
+
                 user_res = await self.llm_service._chat(
                     messages=sim_user_messages,
-                    hyperparams=ChatModelHyperparams(temperature=0.7),
+                    hyperparams=ChatModelHyperparams(temperature=0.7, max_tokens=150),
+                    model_override=self.model_config.model_for_simulated_user,
                 )
                 user_msg = ChatMessage(
-                    role=ChatRole.USER, content=user_res.choices[0].message.content
+                    role=ChatRole.USER,
+                    content=user_res.choices[0].message.content,
                 )
                 current_history.append(user_msg)
+                simulation_messages.append(user_msg)
 
-                # Assistant turn (Generation)
+                # === Assistant Turn (with role) ===
+                role_prompt = get_role_prompt(role)
+                context_prompt = build_simulation_context(
+                    original_idea=self._original_idea,
+                    compressed_history=compressed_context,
+                    last_message=user_msg.content or "",
+                    role=role,
+                )
+
                 assistant_messages = [
-                    ChatMessage(role=ChatRole.SYSTEM, content=GENERATION_SYSTEM_PROMPT)
-                ] + current_history
+                    ChatMessage(role=ChatRole.SYSTEM, content=role_prompt),
+                    ChatMessage(role=ChatRole.USER, content=context_prompt),
+                ]
 
                 asst_res = await self.llm_service._chat(
                     messages=assistant_messages,
-                    hyperparams=ChatModelHyperparams(temperature=0.7),
+                    hyperparams=ChatModelHyperparams(
+                        temperature=temperature,
+                        max_tokens=250,
+                    ),
+                    model_override=self.model_config.model_for_generation,
                 )
-                asst_msg = ChatMessage(
-                    role=ChatRole.ASSISTANT, content=asst_res.choices[0].message.content
-                )
+                asst_content = asst_res.choices[0].message.content or ""
+                asst_msg = ChatMessage(role=ChatRole.ASSISTANT, content=asst_content)
                 current_history.append(asst_msg)
+                simulation_messages.append(asst_msg)
+
+                # === Parse PCB Response ===
+                pcb_response = self._parse_pcb_response(asst_content)
+
+                # === Micro-Judge Scoring ===
+                turn_score = await self._score_turn(
+                    history=current_history[:-1],
+                    current_turn=asst_content,
+                    turn_number=turn_num,
+                )
+                turn_scores.append(turn_score)
+
+                # === Update Node Context ===
+                if pcb_response:
+                    turn_summary = TurnSummary(
+                        turn_number=turn_num,
+                        role=role.value,
+                        key_proposal=(
+                            pcb_response.proposal[:200]
+                            if pcb_response.proposal
+                            else None
+                        ),
+                        cons_identified=pcb_response.cons[:2],
+                        benefits_claimed=pcb_response.benefits[:2],
+                        token_count=len(asst_content.split()),
+                    )
+                    node.context.turn_summaries.append(turn_summary)
+
+                # === Check Early Termination ===
+                early_termination = self._check_early_termination(turn_scores)
+                if early_termination != EarlyTermination.NONE:
+                    logger.info(
+                        f"Early termination at turn {turn_num}: {early_termination.value}"
+                    )
+                    break
+
+                # Update compressed context for next turn
+                compressed_context = self._build_compressed_context(node)
 
             except Exception as e:
-                logger.error(f"Simulation failed: {e}")
+                logger.error(f"Simulation turn {turn_num} failed: {e}")
+                early_termination = EarlyTermination.ERROR
                 break
 
-        # Simple scoring: Length of conversation? Or ask a judge to rate the final state?
-        # Let's just return a static score for now, or maybe 1.0 if it completed successfully.
-        # A real implementation would have a reward function.
-        # Let's assume longer conversations are better?
-        return 1.0
+        # === Final Judge Evaluation ===
+        final_score = None
+        if len(turn_scores) >= 3:
+            final_score = await self._score_final(
+                original_idea=self._original_idea,
+                conversation=simulation_messages,
+            )
+
+        # === Build Simulation Result ===
+        result = SimulationResult(
+            turn_scores=turn_scores,
+            final_score=final_score,
+            early_termination=early_termination,
+            exchanges_completed=len(turn_scores),
+        )
+
+        # Store simulation data in node metadata
+        node.metadata["simulation_result"] = result.model_dump()
+
+        logger.info(
+            f"Simulation complete: {len(turn_scores)} turns, "
+            f"reward={result.final_reward:.3f}, "
+            f"termination={early_termination.value}"
+        )
+
+        return result.final_reward
+
+    def _parse_pcb_response(self, content: str) -> PCBResponse | None:
+        """Parse and validate PCB-format response."""
+        try:
+            # Handle markdown code blocks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            data = json.loads(content)
+            return PCBResponse(**data)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.debug(f"Failed to parse PCB response: {e}")
+            return None
+
+    async def _score_turn(
+        self,
+        history: list[ChatMessage],
+        current_turn: str,
+        turn_number: int,
+    ) -> TurnScore:
+        """Score a single turn using LLM micro-judge."""
+        # Format history for prompt
+        history_str = "\n".join(
+            f"{m.role.value.upper()}: {m.content}" for m in history[-6:]
+        )
+
+        messages = [
+            ChatMessage(role=ChatRole.SYSTEM, content=MICRO_JUDGE_SYSTEM_PROMPT),
+            ChatMessage(
+                role=ChatRole.USER,
+                content=MICRO_JUDGE_USER_TEMPLATE.format(
+                    history=history_str,
+                    current_turn=current_turn,
+                ),
+            ),
+        ]
+
+        try:
+            res = await self.llm_service._chat(
+                messages=messages,
+                hyperparams=ChatModelHyperparams(temperature=0.1, max_tokens=200),
+                model_override=self.model_config.model_for_micro_judge,
+            )
+
+            content = res.choices[0].message.content or "{}"
+            # Clean markdown
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            data = json.loads(content)
+            return TurnScore(
+                turn_number=turn_number,
+                structure=data.get("structure", 0.5),
+                novelty=data.get("novelty", 0.5),
+                depth=data.get("depth", 0.5),
+                engagement=data.get("engagement", 0.5),
+                progress=data.get("progress", 0.5),
+            )
+        except Exception as e:
+            logger.warning(f"Micro-judge failed, using neutral scores: {e}")
+            return TurnScore(
+                turn_number=turn_number,
+                structure=0.5,
+                novelty=0.5,
+                depth=0.5,
+                engagement=0.5,
+                progress=0.5,
+            )
+
+    async def _score_final(
+        self,
+        original_idea: str,
+        conversation: list[ChatMessage],
+    ) -> FinalScore:
+        """Score the complete conversation using final judge."""
+        conversation_str = "\n\n".join(
+            f"[{m.role.value.upper()}]: {m.content}" for m in conversation
+        )
+
+        messages = [
+            ChatMessage(role=ChatRole.SYSTEM, content=FINAL_JUDGE_SYSTEM_PROMPT),
+            ChatMessage(
+                role=ChatRole.USER,
+                content=FINAL_JUDGE_USER_TEMPLATE.format(
+                    original_idea=original_idea,
+                    conversation=conversation_str,
+                ),
+            ),
+        ]
+
+        try:
+            res = await self.llm_service._chat(
+                messages=messages,
+                hyperparams=ChatModelHyperparams(temperature=0.1, max_tokens=300),
+                model_override=self.model_config.model_for_final_judge,
+            )
+
+            content = res.choices[0].message.content or "{}"
+            # Clean markdown
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            data = json.loads(content)
+            return FinalScore(
+                convergence=data.get("convergence", 0.5),
+                coverage=data.get("coverage", 0.5),
+                coherence=data.get("coherence", 0.5),
+                outcome_quality=data.get("outcome_quality", 0.5),
+                reasoning=data.get("reasoning", ""),
+            )
+        except Exception as e:
+            logger.warning(f"Final judge failed, using neutral scores: {e}")
+            return FinalScore(
+                convergence=0.5,
+                coverage=0.5,
+                coherence=0.5,
+                outcome_quality=0.5,
+                reasoning="Judge evaluation failed",
+            )
+
+    def _check_early_termination(
+        self,
+        turn_scores: list[TurnScore],
+    ) -> EarlyTermination:
+        """Check if simulation should terminate early."""
+        if len(turn_scores) < 3:
+            return EarlyTermination.NONE
+
+        recent = turn_scores[-3:]
+
+        # Low quality: 3 consecutive turns below 0.3
+        if all(ts.weighted_total < 0.3 for ts in recent):
+            return EarlyTermination.LOW_QUALITY
+
+        # Plateau: no meaningful improvement for 3 turns
+        if len(turn_scores) >= 3:
+            deltas = [
+                turn_scores[i].weighted_total - turn_scores[i - 1].weighted_total
+                for i in range(len(turn_scores) - 2, len(turn_scores))
+            ]
+            if all(abs(d) < 0.05 for d in deltas):
+                return EarlyTermination.PLATEAU
+
+        return EarlyTermination.NONE
+
+    def _build_compressed_context(self, node: MCTSNode) -> str:
+        """Build compressed context string from node's turn summaries."""
+        if not node.context.turn_summaries:
+            return node.context.accumulated_summary or "No prior context."
+
+        parts = []
+        # Only use last 4 turn summaries to limit context
+        for ts in node.context.turn_summaries[-4:]:
+            parts.append(f"[Turn {ts.turn_number} - {ts.role}]")
+            if ts.key_proposal:
+                parts.append(f"  Proposal: {ts.key_proposal}")
+            if ts.cons_identified:
+                parts.append(f"  Cons: {', '.join(ts.cons_identified)}")
+            if ts.benefits_claimed:
+                parts.append(f"  Benefits: {', '.join(ts.benefits_claimed)}")
+
+        return "\n".join(parts) if parts else "No prior context."
 
     def _backpropagate(self, node: MCTSNode, score: float) -> None:
         """Update visits and value up the tree."""
