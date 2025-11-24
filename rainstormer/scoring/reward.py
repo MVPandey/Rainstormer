@@ -9,7 +9,6 @@ from ..schema.scoring import (
     NoveltyScore,
     EarlyTermination,
 )
-from ..schema.mcts import MCTSNode
 from ..services.chat import ChatModelService, ChatModelHyperparams, ModelConfig
 from ..prompts.mcts import (
     MICRO_JUDGE_SYSTEM_PROMPT,
@@ -303,34 +302,6 @@ class RewardService:
         avg_improvement = sum(positive_deltas) / len(positive_deltas)
         # Scale: 0.1 improvement = full bonus
         return min(1.0, 0.5 + avg_improvement * 5)
-
-    def get_sibling_summaries(self, node: MCTSNode) -> list[str]:
-        """
-        Get proposal summaries from sibling nodes for novelty comparison.
-
-        Args:
-            node: The node to find siblings for.
-
-        Returns:
-            List of proposal summaries from siblings.
-        """
-        # This would need access to the tree to find siblings
-        # For now, return proposals from node's context if available
-        summaries = []
-
-        # Check if node has simulation result with proposals
-        if "simulation_result" in node.metadata:
-            result = node.metadata["simulation_result"]
-            if isinstance(result, dict) and "turn_scores" in result:
-                # We don't store proposals in turn_scores, so check context
-                pass
-
-        # Get from context turn summaries
-        for ts in node.context.turn_summaries:
-            if ts.key_proposal:
-                summaries.append(ts.key_proposal)
-
-        return summaries
 
     @staticmethod
     def _clean_json(content: str) -> str:

@@ -27,7 +27,12 @@ from ..prompts.structured import (
     get_simulated_user_prompt,
     build_simulation_context,
 )
+from ..tools import BRAINSTORMING_TOOLS, execute_tool, summarize_tool_result
+from .context import ContextService, get_exploration_coefficient
 from ..utils.logger import logger
+
+# Maximum tool calls per simulation to limit costs
+MAX_TOOL_CALLS_PER_SIMULATION = 4
 
 
 class MCTSService:
@@ -41,9 +46,12 @@ class MCTSService:
         self.llm_service = llm_service
         self.model_config = model_config or ModelConfig()
         self.reward_service = RewardService(llm_service, self.model_config)
+        self.context_service = ContextService(llm_service, self.model_config)
         self.tree: MCTSTree | None = None
         self.context_messages: list[ChatMessage] = []
         self._original_idea: str = ""
+        self._current_iteration: int = 0
+        self._total_iterations: int = 0
 
     async def run(
         self,
@@ -70,8 +78,10 @@ class MCTSService:
         # For simplicity, we'll pass the full context to the LLM but the tree starts at the last message
         self.context_messages = initial_messages[:-1]
         self._original_idea = root_message.content or ""
+        self._total_iterations = iterations
 
         for i in range(iterations):
+            self._current_iteration = i
             logger.info(f"MCTS Iteration {i + 1}/{iterations}")
 
             # 1. Selection
@@ -121,14 +131,23 @@ class MCTSService:
 
     def _select(self, node: MCTSNode) -> MCTSNode:
         """
-        Select a node to expand using UCT.
+        Select a node to expand using UCT with adaptive exploration.
+
+        The exploration coefficient varies based on search progress:
+        - Early iterations (< 30%): C = 2.0 (explore widely)
+        - Middle iterations (30-70%): C = 1.414 (balanced)
+        - Late iterations (> 70%): C = 0.8 (exploit best paths)
+
         Traverse down until we find a leaf or a node with unexplored children.
         """
+        # Get adaptive exploration coefficient
+        exploration_c = get_exploration_coefficient(
+            self._current_iteration,
+            self._total_iterations,
+        )
+
         current = node
         while current.children:
-            # If any child has 0 visits, pick it (or maybe we want to expand all at once?
-            # In our logic, we expand all children at once. So we just pick the best UCT child.)
-
             # Calculate UCT for all children
             # UCT = value/visits + C * sqrt(ln(parent_visits) / visits)
             best_child = None
@@ -138,12 +157,10 @@ class MCTSService:
 
             for child in current.children:
                 if child.visits == 0:
-                    # If a child is unvisited, we should probably visit it.
-                    # In standard MCTS, we expand one child at a time.
-                    # Here we generated both. Let's prioritize unvisited nodes.
+                    # Prioritize unvisited nodes
                     return child
 
-                uct = (child.value / child.visits) + 1.414 * math.sqrt(
+                uct = (child.value / child.visits) + exploration_c * math.sqrt(
                     log_parent_visits / child.visits
                 )
                 if uct > best_score:
@@ -196,17 +213,29 @@ class MCTSService:
         parent: MCTSNode,
         new_children: list[MCTSNode],
     ) -> None:
-        """Score novelty of new children against existing siblings."""
-        # Get summaries from existing siblings (if any prior children exist)
-        sibling_summaries = self.reward_service.get_sibling_summaries(parent)
+        """
+        Score novelty of new children against actual sibling nodes.
 
-        for child in new_children:
-            proposal = child.message.content or ""
-            # Truncate proposal for comparison
-            proposal_summary = proposal[:500] if len(proposal) > 500 else proposal
+        Compares each new child against:
+        1. Existing siblings from prior expansions of this parent
+        2. Other children generated in the same expansion batch
+        """
+        # Get proposals from NEW children being added
+        new_proposals = [(child.message.content or "")[:500] for child in new_children]
+
+        # Get proposals from EXISTING siblings (children already attached to parent)
+        existing_siblings = [c for c in parent.children if c not in new_children]
+        existing_proposals = [
+            (c.message.content or "")[:500] for c in existing_siblings
+        ]
+
+        for i, child in enumerate(new_children):
+            # Compare against: existing siblings + other new children (not self)
+            other_new = [p for j, p in enumerate(new_proposals) if j != i]
+            sibling_summaries = existing_proposals + other_new
 
             novelty_score = await self.reward_service.score_novelty(
-                new_proposal=proposal_summary,
+                new_proposal=new_proposals[i],
                 sibling_summaries=sibling_summaries,
             )
 
@@ -214,8 +243,10 @@ class MCTSService:
             child.metadata["novelty_score"] = novelty_score.novelty_score
             child.metadata["novelty_reasoning"] = novelty_score.reasoning
 
-            # Add this proposal to sibling summaries for next iteration
-            sibling_summaries.append(proposal_summary)
+            logger.debug(
+                f"Novelty for child {child.id}: {novelty_score.novelty_score:.2f} "
+                f"(compared against {len(sibling_summaries)} siblings)"
+            )
 
     async def _evaluate_pair(self, node_a: MCTSNode, node_b: MCTSNode) -> int:
         """
@@ -300,9 +331,11 @@ class MCTSService:
         current_history = list(history)
         simulation_messages: list[ChatMessage] = []
 
-        # Track scoring
+        # Track scoring and tool usage
         turn_scores: list[TurnScore] = []
         early_termination = EarlyTermination.NONE
+        tool_calls_made = 0
+        tool_results_context: list[str] = []
 
         # Build compressed context for prompts
         compressed_context = self._build_compressed_context(node)
@@ -312,6 +345,7 @@ class MCTSService:
             turn_num = turn_config.turn_number
             role = turn_config.role
             temperature = turn_config.temperature
+            allow_tools = turn_config.allow_tools
 
             logger.debug(f"Simulation turn {turn_num}: {role.value}")
 
@@ -334,11 +368,19 @@ class MCTSService:
                 current_history.append(user_msg)
                 simulation_messages.append(user_msg)
 
-                # === Assistant Turn (with role) ===
+                # === Assistant Turn (with role and optional tools) ===
                 role_prompt = get_role_prompt(role)
+
+                # Include tool results in context if any
+                tool_context = ""
+                if tool_results_context:
+                    tool_context = "\n\nTOOL RESULTS:\n" + "\n".join(
+                        tool_results_context
+                    )
+
                 context_prompt = build_simulation_context(
                     original_idea=self._original_idea,
-                    compressed_history=compressed_context,
+                    compressed_history=compressed_context + tool_context,
                     last_message=user_msg.content or "",
                     role=role,
                 )
@@ -348,6 +390,11 @@ class MCTSService:
                     ChatMessage(role=ChatRole.USER, content=context_prompt),
                 ]
 
+                # Determine if tools should be offered this turn
+                tools_for_turn = None
+                if allow_tools and tool_calls_made < MAX_TOOL_CALLS_PER_SIMULATION:
+                    tools_for_turn = BRAINSTORMING_TOOLS
+
                 asst_res = await self.llm_service._chat(
                     messages=assistant_messages,
                     hyperparams=ChatModelHyperparams(
@@ -355,8 +402,35 @@ class MCTSService:
                         max_tokens=250,
                     ),
                     model_override=self.model_config.model_for_generation,
+                    tools=tools_for_turn,
                 )
-                asst_content = asst_res.choices[0].message.content or ""
+
+                # Handle tool calls if any
+                choice = asst_res.choices[0]
+                if (
+                    choice.message.tool_calls
+                    and tool_calls_made < MAX_TOOL_CALLS_PER_SIMULATION
+                ):
+                    for tool_call in choice.message.tool_calls:
+                        if tool_calls_made >= MAX_TOOL_CALLS_PER_SIMULATION:
+                            break
+
+                        tool_name = tool_call.function.name
+                        try:
+                            args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+
+                        logger.debug(f"Executing tool: {tool_name} with args: {args}")
+                        result = await execute_tool(tool_name, args)
+                        summary = summarize_tool_result(tool_name, result)
+                        tool_results_context.append(summary)
+                        tool_calls_made += 1
+
+                        # Store in node context
+                        node.context.tool_results[tool_name] = summary
+
+                asst_content = choice.message.content or ""
                 asst_msg = ChatMessage(role=ChatRole.ASSISTANT, content=asst_content)
                 current_history.append(asst_msg)
                 simulation_messages.append(asst_msg)
@@ -427,6 +501,7 @@ class MCTSService:
             novelty_score=novelty_score,
             early_termination=early_termination,
             exchanges_completed=len(turn_scores),
+            tool_calls_made=tool_calls_made,
         )
 
         # Store simulation data in node metadata
