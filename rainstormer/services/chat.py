@@ -80,15 +80,6 @@ class ChatModelService:
             f"Initialized ChatModelService with model={self.llm_name}, base_url={self.llm_base_url}"
         )
 
-    async def __aenter__(self):
-        """Enter async context manager."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Exit async context manager - cleanup resources."""
-        await self._client.close()
-        return False
-
     # ============================================================================
     # Public Interface
     # ============================================================================
@@ -219,7 +210,6 @@ class ChatModelService:
         """Convert an OpenAI completion message into a ChatMessage."""
         content = openai_message.content
         if isinstance(content, list):
-            # some providers return structured content arrays
             content = "".join(
                 fragment.get("text", "")
                 if isinstance(fragment, dict)
