@@ -5,30 +5,27 @@ from collections import Counter
 
 from ..schema.llm.message import ChatMessage, ChatRole
 from ..schema.mcts import MCTSNode, MCTSTree, TurnSummary
-from ..schema.scoring import TurnScore, FinalScore, SimulationResult, EarlyTermination
+from ..schema.scoring import (
+    TurnScore,
+    FinalScore,
+    NoveltyScore,
+    SimulationResult,
+    EarlyTermination,
+)
 from ..schema.structured_output import (
     PCBResponse,
-    TurnRole,
     TURN_CONFIGS,
-    MicroJudgeVerdict,
 )
 from ..services.chat import ChatModelService, ChatModelHyperparams, ModelConfig
+from ..scoring.reward import RewardService
 from ..prompts.mcts import (
     GENERATION_SYSTEM_PROMPT,
-    SIMULATION_USER_SYSTEM_PROMPT,
     JUDGE_SYSTEM_PROMPT,
-    MICRO_JUDGE_SYSTEM_PROMPT,
-    MICRO_JUDGE_USER_TEMPLATE,
-    FINAL_JUDGE_SYSTEM_PROMPT,
-    FINAL_JUDGE_USER_TEMPLATE,
-    NOVELTY_JUDGE_SYSTEM_PROMPT,
-    NOVELTY_JUDGE_USER_TEMPLATE,
 )
 from ..prompts.structured import (
     get_role_prompt,
     get_simulated_user_prompt,
     build_simulation_context,
-    PCB_SCHEMA_INSTRUCTION,
 )
 from ..utils.logger import logger
 
@@ -43,6 +40,7 @@ class MCTSService:
     ):
         self.llm_service = llm_service
         self.model_config = model_config or ModelConfig()
+        self.reward_service = RewardService(llm_service, self.model_config)
         self.tree: MCTSTree | None = None
         self.context_messages: list[ChatMessage] = []
         self._original_idea: str = ""
@@ -157,30 +155,10 @@ class MCTSService:
         return current
 
     async def _expand(self, node: MCTSNode) -> list[MCTSNode]:
-        """Generate 2 candidate responses."""
+        """Generate 2 candidate responses with novelty scoring."""
         logger.info(f"Expanding node {node.id}")
 
-        # Construct message history
-        messages = list(self.context_messages)
-
-        # Reconstruct path from root to node
-        # Since we don't have parent pointers easily traversable without a map or search,
-        # we might need to store the path or just rely on the fact that we are passing the node.
-        # Wait, MCTSNode has parent_id but not the object.
-        # We need to reconstruct the conversation history.
-        # For simplicity, let's assume the node.message is the last message.
-        # BUT, we need the full history to generate a good response.
-        # We can traverse down from root if we had the path.
-        # Or we can store the full conversation in the node (heavy).
-        # Or we can implement a `get_ancestry` method if we had a node map.
-
-        # Let's implement a simple ancestry lookup by traversing from root? No, that's slow.
-        # Let's just store the `history` in the node for this MVP, or a reference to it.
-        # Actually, let's just use `parent_id` and look it up if we register nodes in the tree.
-        # For now, let's just assume we can get the history.
-        # Hack: Pass history down during selection?
-
-        # Let's do a quick traversal helper since we have the tree root.
+        # Get history for context
         history = self._get_history(node)
 
         # Add system prompt
@@ -204,11 +182,40 @@ class MCTSService:
                 node.add_child(child)
                 new_nodes.append(child)
 
+            # Score novelty for each new node against existing siblings
+            await self._score_novelty_for_children(node, new_nodes)
+
             return new_nodes
 
         except Exception as e:
             logger.error(f"Error expanding node: {e}")
             return []
+
+    async def _score_novelty_for_children(
+        self,
+        parent: MCTSNode,
+        new_children: list[MCTSNode],
+    ) -> None:
+        """Score novelty of new children against existing siblings."""
+        # Get summaries from existing siblings (if any prior children exist)
+        sibling_summaries = self.reward_service.get_sibling_summaries(parent)
+
+        for child in new_children:
+            proposal = child.message.content or ""
+            # Truncate proposal for comparison
+            proposal_summary = proposal[:500] if len(proposal) > 500 else proposal
+
+            novelty_score = await self.reward_service.score_novelty(
+                new_proposal=proposal_summary,
+                sibling_summaries=sibling_summaries,
+            )
+
+            # Store novelty in child metadata
+            child.metadata["novelty_score"] = novelty_score.novelty_score
+            child.metadata["novelty_reasoning"] = novelty_score.reasoning
+
+            # Add this proposal to sibling summaries for next iteration
+            sibling_summaries.append(proposal_summary)
 
     async def _evaluate_pair(self, node_a: MCTSNode, node_b: MCTSNode) -> int:
         """
@@ -405,10 +412,19 @@ class MCTSService:
                 conversation=simulation_messages,
             )
 
+        # === Get Novelty Score from node metadata (set during expansion) ===
+        novelty_score = None
+        if "novelty_score" in node.metadata:
+            novelty_score = NoveltyScore(
+                novelty_score=node.metadata.get("novelty_score", 0.5),
+                reasoning=node.metadata.get("novelty_reasoning", ""),
+            )
+
         # === Build Simulation Result ===
         result = SimulationResult(
             turn_scores=turn_scores,
             final_score=final_score,
+            novelty_score=novelty_score,
             early_termination=early_termination,
             exchanges_completed=len(turn_scores),
         )
@@ -419,6 +435,7 @@ class MCTSService:
         logger.info(
             f"Simulation complete: {len(turn_scores)} turns, "
             f"reward={result.final_reward:.3f}, "
+            f"novelty={novelty_score.novelty_score if novelty_score else 'N/A'}, "
             f"termination={early_termination.value}"
         )
 
@@ -445,109 +462,23 @@ class MCTSService:
         current_turn: str,
         turn_number: int,
     ) -> TurnScore:
-        """Score a single turn using LLM micro-judge."""
-        # Format history for prompt
-        history_str = "\n".join(
-            f"{m.role.value.upper()}: {m.content}" for m in history[-6:]
+        """Delegate turn scoring to RewardService."""
+        return await self.reward_service.score_turn(
+            history=history,
+            current_turn=current_turn,
+            turn_number=turn_number,
         )
-
-        messages = [
-            ChatMessage(role=ChatRole.SYSTEM, content=MICRO_JUDGE_SYSTEM_PROMPT),
-            ChatMessage(
-                role=ChatRole.USER,
-                content=MICRO_JUDGE_USER_TEMPLATE.format(
-                    history=history_str,
-                    current_turn=current_turn,
-                ),
-            ),
-        ]
-
-        try:
-            res = await self.llm_service._chat(
-                messages=messages,
-                hyperparams=ChatModelHyperparams(temperature=0.1, max_tokens=200),
-                model_override=self.model_config.model_for_micro_judge,
-            )
-
-            content = res.choices[0].message.content or "{}"
-            # Clean markdown
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            data = json.loads(content)
-            return TurnScore(
-                turn_number=turn_number,
-                structure=data.get("structure", 0.5),
-                novelty=data.get("novelty", 0.5),
-                depth=data.get("depth", 0.5),
-                engagement=data.get("engagement", 0.5),
-                progress=data.get("progress", 0.5),
-            )
-        except Exception as e:
-            logger.warning(f"Micro-judge failed, using neutral scores: {e}")
-            return TurnScore(
-                turn_number=turn_number,
-                structure=0.5,
-                novelty=0.5,
-                depth=0.5,
-                engagement=0.5,
-                progress=0.5,
-            )
 
     async def _score_final(
         self,
         original_idea: str,
         conversation: list[ChatMessage],
     ) -> FinalScore:
-        """Score the complete conversation using final judge."""
-        conversation_str = "\n\n".join(
-            f"[{m.role.value.upper()}]: {m.content}" for m in conversation
+        """Delegate final scoring to RewardService."""
+        return await self.reward_service.score_final(
+            original_idea=original_idea,
+            conversation=conversation,
         )
-
-        messages = [
-            ChatMessage(role=ChatRole.SYSTEM, content=FINAL_JUDGE_SYSTEM_PROMPT),
-            ChatMessage(
-                role=ChatRole.USER,
-                content=FINAL_JUDGE_USER_TEMPLATE.format(
-                    original_idea=original_idea,
-                    conversation=conversation_str,
-                ),
-            ),
-        ]
-
-        try:
-            res = await self.llm_service._chat(
-                messages=messages,
-                hyperparams=ChatModelHyperparams(temperature=0.1, max_tokens=300),
-                model_override=self.model_config.model_for_final_judge,
-            )
-
-            content = res.choices[0].message.content or "{}"
-            # Clean markdown
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            data = json.loads(content)
-            return FinalScore(
-                convergence=data.get("convergence", 0.5),
-                coverage=data.get("coverage", 0.5),
-                coherence=data.get("coherence", 0.5),
-                outcome_quality=data.get("outcome_quality", 0.5),
-                reasoning=data.get("reasoning", ""),
-            )
-        except Exception as e:
-            logger.warning(f"Final judge failed, using neutral scores: {e}")
-            return FinalScore(
-                convergence=0.5,
-                coverage=0.5,
-                coherence=0.5,
-                outcome_quality=0.5,
-                reasoning="Judge evaluation failed",
-            )
 
     def _check_early_termination(
         self,

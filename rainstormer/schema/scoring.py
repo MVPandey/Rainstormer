@@ -134,7 +134,11 @@ class SimulationResult(BaseModel):
         Compute final [0,1] bounded reward.
 
         Formula:
-        R = w_micro * mean(turn_scores) + w_trajectory * trajectory_bonus + w_final * final_judge
+        R = w_micro * mean(turn_scores) +
+            w_trajectory * trajectory_bonus +
+            w_final * final_judge +
+            w_novelty * novelty_score +
+            termination_adjustment
         """
         # Early termination penalties/bonuses
         termination_adjustments = {
@@ -146,6 +150,7 @@ class SimulationResult(BaseModel):
             EarlyTermination.ERROR: -0.5,
         }
 
+        # Micro-score component (weight: 0.35)
         if self.turn_scores:
             micro_avg = sum(ts.weighted_total for ts in self.turn_scores) / len(
                 self.turn_scores
@@ -153,11 +158,19 @@ class SimulationResult(BaseModel):
         else:
             micro_avg = 0.0
 
+        # Trajectory bonus (weight: 0.15)
         trajectory = self.trajectory_bonus
 
+        # Final judge score (weight: 0.35)
         final_judge = self.final_score.score if self.final_score else 0.5
 
-        raw_reward = 0.4 * micro_avg + 0.2 * trajectory + 0.4 * final_judge
+        # Novelty component (weight: 0.15)
+        novelty = self.novelty_score.novelty_score if self.novelty_score else 0.5
+
+        # Weighted combination
+        raw_reward = (
+            0.35 * micro_avg + 0.15 * trajectory + 0.35 * final_judge + 0.15 * novelty
+        )
 
         adjustment = termination_adjustments.get(self.early_termination, 0.0)
         raw_reward += adjustment
