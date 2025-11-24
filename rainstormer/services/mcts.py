@@ -74,11 +74,12 @@ class MCTSService:
                 # We evaluate the children to pick a "winner" to explore first or just evaluate all?
                 # Standard MCTS expands one node. Here we generated 2.
                 # Let's evaluate them against each other to assign initial values/metadata.
-                winner_idx = await self._evaluate_pair(children[0], children[1])
-
-                # We can simulate from the winner, or both.
-                # Let's simulate from the winner to get a rollout score.
-                simulation_node = children[winner_idx]
+                if len(children) >= 2:
+                    winner_idx = await self._evaluate_pair(children[0], children[1])
+                    simulation_node = children[winner_idx]
+                else:
+                    # Only one child was generated (e.g., provider doesn't support n>1)
+                    simulation_node = children[0]
                 score = await self._simulate(simulation_node)
 
                 # 4. Backpropagation

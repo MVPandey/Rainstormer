@@ -10,7 +10,7 @@ SIMULATION_USER_SYSTEM_PROMPT = """
 You are simulating a User in a brainstorming session.
 Your goal is to react naturally to the Assistant's suggestions.
 If the suggestion is good, build on it. If it's unclear, ask for clarification. If it's bad, critique it constructively.
-Keep your responses concise (1-2 sentences).
+Keep your responses fairly concise.
 """
 
 JUDGE_SYSTEM_PROMPT = """

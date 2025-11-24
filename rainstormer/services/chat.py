@@ -1,5 +1,6 @@
 """Contains the chat model service class."""
 
+import asyncio
 import inspect
 import json
 
@@ -16,7 +17,7 @@ from ..utils.logger import logger
 class ChatModelHyperparams(BaseModel):
     """Hyperparameters for the chat model."""
 
-    temperature: float = Field(default=0.7, ge=0.0, le=1.0)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1000, ge=1, le=8192)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     frequency_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -25,6 +26,48 @@ class ChatModelHyperparams(BaseModel):
     stop: list[str] = Field(default=[], description="Stop tokens")
     stream: bool = Field(default=False, description="Stream the response")
     logprobs: int | None = Field(default=None, ge=0, le=10)
+
+
+class ModelConfig(BaseModel):
+    """Configuration for multi-model strategy."""
+
+    # Primary model for main generation (assistant responses)
+    primary_model: str = Field(
+        default="anthropic/claude-sonnet-4",
+        description="Primary model for high-quality generation",
+    )
+
+    # Cheaper model for auxiliary tasks
+    auxiliary_model: str = Field(
+        default="openai/gpt-4o-mini",
+        description="Cheaper model for judges, simulated users, etc.",
+    )
+
+    # Model assignments by task type
+    @property
+    def model_for_generation(self) -> str:
+        """Model for main brainstorming generation."""
+        return self.primary_model
+
+    @property
+    def model_for_simulated_user(self) -> str:
+        """Model for simulated user responses."""
+        return self.auxiliary_model
+
+    @property
+    def model_for_micro_judge(self) -> str:
+        """Model for per-turn micro-scoring."""
+        return self.auxiliary_model
+
+    @property
+    def model_for_final_judge(self) -> str:
+        """Model for final conversation evaluation."""
+        return self.primary_model
+
+    @property
+    def model_for_novelty_judge(self) -> str:
+        """Model for novelty comparison."""
+        return self.auxiliary_model
 
 
 class ChatModelService:
@@ -89,16 +132,25 @@ class ChatModelService:
         messages: list[ChatMessage] | ChatMessage | str,
         hyperparams: ChatModelHyperparams | None = None,
         tools: list[Tool] | None = None,
+        model_override: str | None = None,
     ) -> ChatCompletion:
         """
         Execute a chat completion, optionally handling tool calls until resolution.
+
+        Args:
+            messages: Messages to send to the model.
+            hyperparams: Optional hyperparameters for the completion.
+            tools: Optional tools available for the model to call.
+            model_override: Optional model name to use instead of the default.
+                           Useful for multi-model strategies (e.g., cheaper models
+                           for judges or simulated users).
         """
         try:
             normalized_messages = self._normalize_messages(messages)
             tool_defs, tool_map = self._prepare_tools(tools)
 
             completion = await self._create_completion(
-                normalized_messages, hyperparams, tool_defs
+                normalized_messages, hyperparams, tool_defs, model_override
             )
 
             iteration = 0
@@ -122,7 +174,7 @@ class ChatModelService:
                 normalized_messages.extend(tool_responses)
 
                 completion = await self._create_completion(
-                    normalized_messages, hyperparams, tool_defs
+                    normalized_messages, hyperparams, tool_defs, model_override
                 )
                 iteration += 1
 
@@ -144,8 +196,17 @@ class ChatModelService:
         messages: list[ChatMessage],
         hyperparams: ChatModelHyperparams | None,
         tool_defs: list[dict[str, object]] | None,
+        model_override: str | None = None,
     ) -> ChatCompletion:
-        """Invoke the OpenAI completion endpoint."""
+        """
+        Invoke the OpenAI completion endpoint.
+
+        Args:
+            messages: Normalized messages to send.
+            hyperparams: Optional hyperparameters.
+            tool_defs: Optional tool definitions.
+            model_override: Optional model name to use instead of default.
+        """
         # normalize messages for OpenAI API (e.g., DEVELOPER -> SYSTEM)
         normalized_for_api: list[ChatMessage] = []
         for m in messages:
@@ -163,10 +224,16 @@ class ChatModelService:
             for message in normalized_for_api
         ]
 
+        # Use model_override if provided, otherwise default to self.llm_name
+        model_name = model_override or self.llm_name
+
         request_kwargs: dict[str, object] = {
-            "model": self.llm_name,
+            "model": model_name,
             "messages": payload_messages,
         }
+
+        if model_override:
+            logger.debug(f"Using model override: {model_override}")
 
         if hyperparams:
             request_kwargs.update(hyperparams.model_dump(exclude_none=True))
@@ -178,7 +245,45 @@ class ChatModelService:
             extra={"has_tools": bool(tool_defs), "message_count": len(messages)},
         )
 
+        requested_n = hyperparams.n if hyperparams else 1
+
+        if requested_n > 1:
+            return await self._parallel_completions(requested_n, request_kwargs)
+
         return await self._client.chat.completions.create(**request_kwargs)
+
+    async def _parallel_completions(
+        self,
+        n: int,
+        request_kwargs: dict[str, object],
+    ) -> ChatCompletion:
+        """Make n parallel completion calls and combine results."""
+        single_request_kwargs = {**request_kwargs, "n": 1}
+
+        tasks = [
+            self._client.chat.completions.create(**single_request_kwargs)
+            for _ in range(n)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_choices = []
+        base_completion = None
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"Parallel completion call failed: {res}")
+                continue
+            if base_completion is None:
+                base_completion = res
+            if res.choices:
+                choice = res.choices[0]
+                choice.index = len(all_choices)
+                all_choices.append(choice)
+
+        if base_completion is None:
+            raise ChatModelError("All parallel completion calls failed")
+
+        base_completion.choices = all_choices
+        return base_completion
 
     @staticmethod
     def _normalize_messages(
